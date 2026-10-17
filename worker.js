@@ -237,9 +237,16 @@ export default {
       return json(405, { error: 'Method not allowed' }, origin);
     }
 
-    // 1. App key check
+    // 1. App key check — COMPAT WINDOW (opened 2026-10-16):
+    // The shipped app (v1.0.3, iOS + web) predates the app key and sends no
+    // X-Tuitioneer-Key header; hard-rejecting missing keys took Ollie
+    // offline for live users. While this window is open: a PRESENT but
+    // wrong key is rejected (401); a MISSING key is allowed through, still
+    // bounded by the model lock, the token cap, moderation, and the per-IP
+    // rate limit below. CLOSE THIS WINDOW (restore the hard 401 for missing
+    // keys) as soon as the keyed build (v1.0.4) is the live app.
     const appKey = request.headers.get('X-Tuitioneer-Key');
-    if (!env.TUITIONEER_APP_KEY || appKey !== env.TUITIONEER_APP_KEY) {
+    if (appKey !== null && appKey !== env.TUITIONEER_APP_KEY) {
       return json(401, { error: 'Unauthorized' }, origin);
     }
 
