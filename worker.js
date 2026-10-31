@@ -137,10 +137,12 @@ function sanitizeBody(raw) {
 // only — deliberately modest, precise lists to avoid false positives
 // on normal homework text. Message content is never logged.
 const MODERATION_CANNED = {
+  // R1 crisis protocol: named, reachable help. Keep in sync with the
+  // app's ModerationService.safeResponseFor.
   self_harm:
-    'That sounds important. Please talk to a trusted adult or parent about this right away. 💜',
+    "I'm so glad you told me. What you're feeling matters, and you deserve support from people who know how to help. Please talk to a trusted adult or parent right away. You can also call or text 988 any time — free, 24/7 in the US — or find a helpline in your country at findahelpline.org. You don't have to go through this alone. 💜",
   abuse_disclosure:
-    'That sounds important. Please talk to a trusted adult or parent about this right away. 💜',
+    "Thank you for trusting me with that — telling someone is a brave and important step. Please tell a trusted adult, like a parent, teacher, or school counsellor, as soon as you can. In the US, Childhelp answers at 1-800-422-4453; in the UK, Childline is 0800 1111 — both free and private. 💜",
   sexual_content:
     "That's not something I can help with — let's keep our chat about learning! What subject would you like to explore today? 🦉",
   pii_share:
