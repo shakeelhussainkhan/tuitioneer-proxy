@@ -160,6 +160,27 @@ const SELF_HARM_TERMS = [
   'dont want to live',
   'cut myself',
   'starve myself',
+  'hang myself',
+  'suicidal',
+  'want to die',
+  'wants to die',
+  'hurt himself',
+  'hurt herself',
+  'harm himself',
+  'harm herself',
+  'kill himself',
+  'kill herself',
+  'quiero matarme',
+  'matarme',
+  'quiero morir',
+  'no quiero vivir',
+  'me quiero morir',
+  'marna hai',
+  'mujhe marna hai',
+  'jeena nahi chahta',
+  'jeena nahi chahti',
+  'main marna chahta',
+  'main marna chahti',
 ];
 
 const ABUSE_DISCLOSURE_TERMS = [
@@ -175,6 +196,16 @@ const ABUSE_DISCLOSURE_TERMS = [
   'beats me',
   'molests',
   'secret touching',
+  'hit their kid',
+  'hits their kid',
+  'hitting their kid',
+  'hits their child',
+  'me pega',
+  'me golpea',
+  'marta hai',
+  'marti hai',
+  'papa marta',
+  'baba marta',
 ];
 
 // Word boundaries so "sex" does not fire on "sextant" / "Essex", etc.
@@ -192,39 +223,75 @@ const PII_PATTERNS = [
   /\bmy full name is\b/,
 ];
 
+// Pen-test hardening (2026-10-31, stream A): the plain substring match
+// was defeated by one leet digit ("k1ll mys3lf"), one extra space
+// ("kill  myself"), punctuation splits, and any non-English phrasing.
+// Match now happens on a normalized form (lowercase, leet folded,
+// punctuation -> space, whitespace collapsed) AND a squeezed
+// letters-only form, with the term lists normalized the same way.
+const LEET_MAP = { '0': 'o', '1': 'i', '3': 'e', '4': 'a', '5': 's', '7': 't', '@': 'a', '$': 's' };
+
+function normalizeForModeration(text) {
+  return text
+    .toLowerCase()
+    .replace(/[013457@$]/g, (c) => LEET_MAP[c])
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function termHit(normalized, squeezed, term) {
+  const nt = normalizeForModeration(term);
+  return (
+    nt.length > 0 &&
+    (normalized.includes(nt) || squeezed.includes(nt.replace(/ /g, '')))
+  );
+}
+
+// Spelled-out email ("samir dot test at example dot com") — matched on
+// the normalized token stream.
+const OBFUSCATED_EMAIL_RE =
+  /\b\w+(?: (?:at|dot) \w+)+ dot (?:com|net|org|io)\b/;
+
 function moderate(text) {
   if (typeof text !== 'string' || text.length === 0) return null;
-  const t = text.toLowerCase();
+  const raw = text.toLowerCase();
+  const n = normalizeForModeration(text);
+  const sq = n.replace(/ /g, '');
   for (const term of SELF_HARM_TERMS) {
-    if (t.includes(term)) return 'self_harm';
+    if (termHit(n, sq, term)) return 'self_harm';
   }
   for (const term of ABUSE_DISCLOSURE_TERMS) {
-    if (t.includes(term)) return 'abuse_disclosure';
+    if (termHit(n, sq, term)) return 'abuse_disclosure';
   }
-  if (SEXUAL_CONTENT_RE.test(t)) return 'sexual_content';
+  if (SEXUAL_CONTENT_RE.test(n)) return 'sexual_content';
   for (const re of PII_PATTERNS) {
-    if (re.test(t)) return 'pii_share';
+    if (re.test(raw) || re.test(n)) return 'pii_share';
   }
+  if (OBFUSCATED_EMAIL_RE.test(n)) return 'pii_share';
   return null;
 }
 
-// Text of the last user message: content may be a plain string, or an
-// array of blocks — concatenate the `text` of blocks with type 'text'
-// (image blocks carry no text).
-function lastUserText(messages) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
+// Texts of ALL user messages (pen-test fix: screening only the last
+// turn let a flagged disclosure wash out by changing the subject).
+// Content may be a plain string, or an array of blocks — concatenate
+// the `text` of blocks with type 'text' (image blocks carry no text).
+function allUserTexts(messages) {
+  const texts = [];
+  for (const m of messages) {
     if (!m || m.role !== 'user') continue;
-    if (typeof m.content === 'string') return m.content;
-    if (Array.isArray(m.content)) {
-      return m.content
-        .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
-        .map((b) => b.text)
-        .join('');
+    if (typeof m.content === 'string') {
+      texts.push(m.content);
+    } else if (Array.isArray(m.content)) {
+      texts.push(
+        m.content
+          .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+          .map((b) => b.text)
+          .join(''),
+      );
     }
-    return '';
   }
-  return '';
+  return texts;
 }
 // ── END PHASE B1: MODERATION ──
 
@@ -267,10 +334,15 @@ export default {
     const { body, error } = sanitizeBody(raw);
     if (error) return json(400, { error }, origin);
 
-    // 3b. PHASE B1: moderation on the last user message. If flagged, do
-    // NOT call Anthropic — return a canned Anthropic-shaped response so
-    // the app's parser works unchanged. Log only category + hashed IP.
-    const category = moderate(lastUserText(body.messages));
+    // 3b. PHASE B1: moderation on EVERY user turn in the history. If
+    // flagged, do NOT call Anthropic — return a canned Anthropic-shaped
+    // response so the app's parser works unchanged. Log only category
+    // + hashed IP.
+    let category = null;
+    for (const t of allUserTexts(body.messages)) {
+      category = moderate(t);
+      if (category) break;
+    }
     if (category) {
       console.log(`moderated category=${category} ip=${hashIp(ip)}`);
       return json(
@@ -310,8 +382,20 @@ export default {
 
     const data = await upstream.text();
     console.log(`ok=${upstream.ok} status=${upstream.status} ip=${hashIp(ip)}`);
+    if (!upstream.ok) {
+      // Pen-test fix (F-A2): never relay Anthropic's raw error body —
+      // it fingerprints the provider and its validation internals.
+      // The upstream status stays in the server log above only.
+      if (upstream.status === 429) {
+        return json(429, { error: 'Upstream busy, try again.' }, origin);
+      }
+      if (upstream.status >= 500) {
+        return json(502, { error: 'Upstream error, try again.' }, origin);
+      }
+      return json(400, { error: 'Invalid request' }, origin);
+    }
     return new Response(data, {
-      status: upstream.status,
+      status: 200,
       headers: { ...corsHeaders(origin), 'Content-Type': 'application/json' },
     });
   },
