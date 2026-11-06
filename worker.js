@@ -18,6 +18,11 @@
  *     apps send no Origin header and are allowed through the app-key check.
  *  6. ABUSE GUARDS — max body 1.5 MB, max 50 messages, system prompt capped.
  *  7. QUIET LOGS — message content is never logged; only status + a hashed IP.
+ *  8. /support — a KEYLESS route for the public website's support widget.
+ *     It is a separate, deliberately small surface: a server-forced support
+ *     prompt (client system/model fields are ignored), no tutoring, a
+ *     10 req/hour/IP limit, a 300-token cap, and the same moderation pass
+ *     as the tutor path — so the widget can never become a free general AI.
  */
 
 const ALLOWED_MODEL = 'claude-haiku-4-5-20251001';
@@ -295,6 +300,162 @@ function allUserTexts(messages) {
 }
 // ── END PHASE B1: MODERATION ──
 
+// ── /support: keyless website support widget ──
+const SUPPORT_RATE_LIMIT = 10; // requests per hour per IP
+const SUPPORT_MAX_TOKENS = 300;
+const SUPPORT_MAX_MESSAGES = 6;
+const SUPPORT_MAX_MSG_CHARS = 500;
+
+const SUPPORT_SYSTEM = [
+  'You are Ollie, the friendly support assistant for TuitioneerAI, an AI',
+  'tutoring app for children in Grades 1-12. You answer questions ABOUT the',
+  'app only. Facts you may use: Ollie the owl tutor teaches with the Socratic',
+  'method - guiding questions, never just giving homework answers. Subjects:',
+  'Maths, Science, English, History, Computing, Languages. Curricula: USA',
+  'Common Core, UK National Curriculum (GCSE and A-Level), Pakistan Federal',
+  'Board (FSc), India CBSE, UAE MOE, Australian, Canadian, and International',
+  'Baccalaureate. Children can ask by voice and snap a photo of homework for',
+  'guided help. Parents get a dashboard with full conversation transcripts,',
+  'progress and safety flags; conversations are moderated for safety and the',
+  'app follows COPPA requirements. Available on iPhone, Android and the web',
+  'at tuitioneer.org. Free to download with free questions every day;',
+  'Premium is $9.99/month or $79.99/year.',
+  'Rules: (1) Never do homework, tutor, or answer school/study questions -',
+  'warmly explain that Ollie the tutor inside the app does that, and invite',
+  'them to download it. (2) For account, billing, subscription or technical',
+  'problems, give only general guidance and direct them to',
+  'hello@tuitioneer.org. (3) Never ask for or accept personal information,',
+  'especially from children. (4) Keep replies under 90 words, friendly and',
+  'plain-spoken. (5) If you do not know something, say so and point to',
+  'hello@tuitioneer.org.',
+].join(' ');
+
+async function checkSupportRateLimit(kv, ip) {
+  const key = `rl-support:${ip}`;
+  const now = Math.floor(Date.now() / 1000);
+  const windowStart = now - RATE_WINDOW_S;
+  let hits = [];
+  try {
+    const raw = await kv.get(key);
+    if (raw) hits = JSON.parse(raw).filter((t) => t > windowStart);
+  } catch (e) {
+    return { limited: false }; // fail open, same as the tutor path
+  }
+  if (hits.length >= SUPPORT_RATE_LIMIT) {
+    const retryAfter = Math.max(1, hits[0] + RATE_WINDOW_S - now);
+    return { limited: true, retryAfter };
+  }
+  hits.push(now);
+  try {
+    await kv.put(key, JSON.stringify(hits), { expirationTtl: RATE_WINDOW_S });
+  } catch (e) { /* fail open */ }
+  return { limited: false };
+}
+
+async function handleSupport(request, env, origin) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+
+  // Tight rate limit — this surface is keyless by design.
+  if (env.TUITIONEER_RL) {
+    const rl = await checkSupportRateLimit(env.TUITIONEER_RL, ip);
+    if (rl.limited) {
+      console.log(`support rate-limited ip=${hashIp(ip)}`);
+      const res = json(429, { error: 'Too many requests, slow down.' }, origin);
+      res.headers.set('Retry-After', String(rl.retryAfter));
+      return res;
+    }
+  }
+
+  const raw = await request.text();
+  if (raw.length > MAX_BODY_BYTES) {
+    return json(413, { error: 'Request too large' }, origin);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    return json(400, { error: 'Invalid JSON body' }, origin);
+  }
+
+  // Client-supplied model/system/max_tokens are IGNORED on this route.
+  // Keep only the last few turns, string content only, tightly capped.
+  const rawMessages = Array.isArray(parsed && parsed.messages) ? parsed.messages : [];
+  const messages = rawMessages
+    .slice(-SUPPORT_MAX_MESSAGES)
+    .filter((m) => m && typeof m.content === 'string' && m.content.trim().length > 0)
+    .map((m) => ({
+      role: m.role === 'assistant' ? 'assistant' : 'user',
+      content: m.content.slice(0, SUPPORT_MAX_MSG_CHARS),
+    }));
+  if (!messages.some((m) => m.role === 'user')) {
+    return json(400, { error: 'messages[] with a user message is required' }, origin);
+  }
+
+  // Same moderation pass as the tutor path — a distressed child can reach
+  // this widget too, and it must answer with the crisis protocol, not AI.
+  let category = null;
+  for (const t of allUserTexts(messages)) {
+    category = moderate(t);
+    if (category) break;
+  }
+  if (category) {
+    console.log(`support moderated category=${category} ip=${hashIp(ip)}`);
+    return json(
+      200,
+      {
+        id: 'moderation-intercept',
+        type: 'message',
+        role: 'assistant',
+        model: ALLOWED_MODEL,
+        content: [{ type: 'text', text: MODERATION_CANNED[category] }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+      origin,
+    );
+  }
+
+  if (!env.ANTHROPIC_API_KEY) {
+    return json(500, { error: 'API key not configured' }, origin);
+  }
+  let upstream;
+  try {
+    upstream = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: ALLOWED_MODEL,
+        max_tokens: SUPPORT_MAX_TOKENS,
+        system: SUPPORT_SYSTEM,
+        messages,
+      }),
+    });
+  } catch (e) {
+    console.log(`support upstream error ip=${hashIp(ip)}`);
+    return json(502, { error: 'Upstream unavailable, try again.' }, origin);
+  }
+  const data = await upstream.text();
+  console.log(`support ok=${upstream.ok} status=${upstream.status} ip=${hashIp(ip)}`);
+  if (!upstream.ok) {
+    if (upstream.status === 429) {
+      return json(429, { error: 'Upstream busy, try again.' }, origin);
+    }
+    if (upstream.status >= 500) {
+      return json(502, { error: 'Upstream error, try again.' }, origin);
+    }
+    return json(400, { error: 'Invalid request' }, origin);
+  }
+  return new Response(data, {
+    status: 200,
+    headers: { ...corsHeaders(origin), 'Content-Type': 'application/json' },
+  });
+}
+// ── END /support ──
+
 export default {
   async fetch(request, env) {
     const origin = request.headers.get('Origin');
@@ -304,6 +465,13 @@ export default {
     }
     if (request.method !== 'POST') {
       return json(405, { error: 'Method not allowed' }, origin);
+    }
+
+    // 0. /support — the keyless website-widget route. Everything else
+    // requires the app key below.
+    const url = new URL(request.url);
+    if (url.pathname === '/support') {
+      return handleSupport(request, env, origin);
     }
 
     // 1. App key check — the compat window opened 2026-10-16 for the
