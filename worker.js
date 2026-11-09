@@ -2,7 +2,7 @@
  * TuitioneerAI — hardened Anthropic proxy (Phase A1 security fix).
  *
  * What changed vs the old passthrough:
- *  1. MODEL LOCK — the model is forced server-side to claude-haiku-4-5-20251001.
+ *  1. MODEL LOCK — the model is forced server-side to claude-haiku-5-5.
  *     A client asking for Opus/Sonnet (or any other model) is silently
  *     downgraded. The API bill can no longer be spiked by a crafted request.
  *  2. REQUEST WHITELIST — only `system`, `messages` pass through, and
@@ -25,7 +25,11 @@
  *     as the tutor path — so the widget can never become a free general AI.
  */
 
-const ALLOWED_MODEL = 'claude-haiku-4-5-20251001';
+const ALLOWED_MODEL = 'claude-haiku-5-5';
+// Haiku 5.5 thinks by default and thinking tokens burn the reply budget
+// (empty/truncated replies — eval 2026-11-08, round2/haiku55-eval). Every
+// Anthropic call therefore carries thinking:{type:'disabled'}, set here
+// server-side because sanitizeBody strips any client-supplied value.
 const MAX_TOKENS_CAP = 500;
 const MAX_BODY_BYTES = 1.5 * 1024 * 1024;
 const MAX_MESSAGES = 50;
@@ -128,6 +132,7 @@ function sanitizeBody(raw) {
   return {
     body: {
       model: ALLOWED_MODEL, // forced — client value ignored
+      thinking: { type: 'disabled' }, // forced — see ALLOWED_MODEL note
       max_tokens: maxTokens,
       system,
       messages: cleanMessages,
@@ -429,6 +434,7 @@ async function handleSupport(request, env, origin) {
       },
       body: JSON.stringify({
         model: ALLOWED_MODEL,
+        thinking: { type: 'disabled' }, // forced — see ALLOWED_MODEL note
         max_tokens: SUPPORT_MAX_TOKENS,
         system: SUPPORT_SYSTEM,
         messages,
